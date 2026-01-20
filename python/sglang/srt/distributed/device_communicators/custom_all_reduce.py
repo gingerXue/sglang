@@ -19,10 +19,11 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.environ import envs
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, log_info_on_rank0
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_musa, log_info_on_rank0
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_musa = is_musa()
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +48,8 @@ class CustomAllreduce:
     if _is_hip:
         # crossover is at 16MB buffer size for ROCm
         _MAX_CAR_SIZE = 2 * 8192 * 1024
-
+    if _is_musa:
+        _MAX_CAR_SIZE = 128 * 1024 * 1024
     # max_size: max supported allreduce size
     def __init__(
         self,
@@ -105,7 +107,7 @@ class CustomAllreduce:
             return
 
         if isinstance(device, int):
-            device = torch.device(f"cuda:{device}")
+            device = torch.device(f"{'cuda' if not _is_musa else 'musa'}:{device}")
         elif isinstance(device, str):
             device = torch.device(device)
         # now `device` is a `torch.device` object
@@ -129,7 +131,7 @@ class CustomAllreduce:
         # test nvlink first, this will filter out most of the cases
         # where custom allreduce is not supported
         # this checks hardware and driver support for NVLink
-        if _is_cuda or _is_hip:
+        if _is_cuda or _is_hip or _is_musa:
             full_nvlink = is_full_nvlink(physical_device_ids, world_size)
 
         if world_size > 2 and not full_nvlink:
@@ -210,6 +212,8 @@ class CustomAllreduce:
         """
         lib = CudaRTLibrary()
         pointer = lib.cudaMalloc(size_in_bytes)
+        if _is_musa:
+            lib.cudaMemset(pointer, 0, size_in_bytes)
         handle = lib.cudaIpcGetMemHandle(pointer)
         world_size = dist.get_world_size(group=group)
         rank = dist.get_rank(group=group)
@@ -433,7 +437,7 @@ def dispatch_custom_allreduce():
     On AMD with 1-stage AR enabled, use sglang's CustomAllreduce (has deterministic_all_reduce method).
     Otherwise use AiterCustomAllreduce if available.
     """
-    if _is_cuda:
+    if _is_cuda or _is_musa:
         return CustomAllreduce
 
     assert _is_hip
